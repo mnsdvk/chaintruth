@@ -1,4 +1,4 @@
-# ChainTruth
+# ChainTruth — Supply Chain Ontology & Governed Conversational Analytics
 
 **One supply chain. One definition. One answer.**
 
@@ -6,7 +6,7 @@ ChainTruth gives every team in a supply chain organisation the same trustworthy 
 
 <!-- Demo video: add link here -->
 
-> All data in this project is synthetic. No production or personal data is used.
+> *Built for the Snowflake CoCo CLI Hackathon, GCC Edition.*
 
 ---
 
@@ -103,7 +103,7 @@ The result is one on-time delivery figure, 69.0%, that every team sees, with a c
 | Days of inventory | On-hand quantity divided by average daily usage, latest snapshot |
 | Landed cost per unit | (Line value + freight + duty) divided by units shipped. Hidden from Planning |
 
-## Sample results
+## Sample results (synthetic data)
 
 Measured on the synthetic dataset on 4 Oct 2026.
 
