@@ -1,0 +1,36 @@
+flowchart LR
+  subgraph SRC[Sources - synthetic]
+    ERP[ERP order lines]
+    TMS[Logistics shipments]
+    INV[Inventory snapshots]
+    DOCS[Contracts and SLAs - unstructured]
+  end
+  subgraph RAW[RAW schema]
+    R1[(ERP_ORDER_LINES)]
+    R2[(LOGISTICS_SHIPMENTS)]
+    R3[(INVENTORY_SNAPSHOTS)]
+    R4[(CONTRACT_DOCS)]
+  end
+  ERP --> R1
+  TMS --> R2
+  INV --> R3
+  DOCS --> R4
+  R2 -- stream --> TASK[Task: late shipment alerts]
+  R1 & R2 --> DT1[Dynamic table: DT_ORDER_LINE canonical metrics]
+  R3 --> DT2[Dynamic table: DT_INVENTORY_LATEST]
+  DT1 & DT2 --> MASK[Masking policies and tags]
+  MASK --> SV[Semantic view: SV_SUPPLY_CHAIN]
+  R4 --> CS[Cortex Search: CONTRACT_SEARCH]
+  SV --> AGENT{{Cortex Agent}}
+  CS --> AGENT
+  AGENT --> UI1[Streamlit app]
+  AGENT --> UI2[Snowsight / Snowflake Intelligence]
+  AGENT --> UI3[Slack via MCP]
+  SV --> TEST[Consistency tests + nightly task]
+  TEST --> ALERTS[(ALERTS)]
+  TASK --> ALERTS
+  ALERTS --> JIRA[Jira via MCP]
+  COCO[[CoCo CLI and Desktop: plan, build, run, test, skills]] -.-> RAW
+  COCO -.-> SV
+  COCO -.-> AGENT
+  COCO -.-> TEST

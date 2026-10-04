@@ -1,0 +1,14 @@
+definition_version: 2
+entities:
+  chaintruth_app:
+    type: streamlit
+    identifier:
+      name: CHAINTRUTH
+      database: SC_ONTOLOGY
+      schema: APP
+    query_warehouse: SC_WH
+    stage: STREAMLIT_STAGE
+    main_file: streamlit_app/app.py
+    artifacts:
+      - streamlit_app/app.py
+      - streamlit_app/environment.yml
