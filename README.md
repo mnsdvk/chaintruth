@@ -14,7 +14,7 @@ ChainTruth gives every team in a supply chain organisation the same trustworthy 
 
 Supply chain data is scattered across ERP, logistics, supplier and warehouse systems, with inconsistent definitions, so the same question yields different answers across teams. Orders sit in the ERP, deliveries in the transport system, stock in the warehouse system and supplier terms in contract documents, and each system and each team defines the same metric slightly differently.
 
-Take on-time delivery. Planning measures when goods leave the warehouse against the date the customer asked for. Procurement measures when the supplier dispatched against the date the supplier promised. Logistics measures when the carrier delivered against the carrier's own estimate. On the sample data, the same deliveries produce three different answers:
+Take on-time delivery. Planning measures when goods leave the warehouse against the date the customer asked for. Procurement measures when the supplier dispatched against the date the supplier promised. Logistics measures when the carrier delivered against the carrier's own estimate. On the sample data (measured 4 Oct 2026), the same deliveries produce three different answers:
 
 | Team | On-time delivery |
 |---|---|
@@ -40,7 +40,7 @@ ChainTruth defines the business once and makes that definition the only way numb
 4. **Show the proof.** Every answer shows its question, result, the definition used, the exact query and the contract clause with its document id, and comes with a downloadable receipt.
 5. **Keep checking.** Automated tests compare every metric against an independent calculation and confirm that roll-ups by supplier, plant or customer add up to the headline number. They run every night.
 
-The result is one on-time delivery figure, 69.0%, that every team sees, with a clear explanation of why each team's old number differed.
+The result is one on-time delivery figure, about 69%, that every team sees, with a clear explanation of why each team's old number differed.
 
 ## Who it is for
 
@@ -60,6 +60,7 @@ The result is one on-time delivery figure, 69.0%, that every team sees, with a c
 - **Refuses to guess.** Ask for something that isn't defined, such as a customer satisfaction score, and it says so and lists what it can answer.
 - **Respects roles.** Planning, Procurement and Logistics see identical shared metrics, while landed cost is hidden from Planning.
 - **Proves itself.** Receipts on every answer and nightly consistency tests.
+- **Quicker on repeat.** Repeated questions can be served from a shared cache, which is only used while the data and definitions are unchanged.
 
 ## Example: from question to action
 
@@ -118,9 +119,15 @@ Measured on the synthetic dataset on 4 Oct 2026.
 
 Delivery figures shift slightly each day as in-transit lines are delivered.
 
+## Performance and caching
+
+- **Metrics are precomputed.** The pipeline calculates the canonical metrics once and refreshes them incrementally, so a question never recomputes the business logic from raw data.
+- **Caching.** Query results, contract lookups and agent answers are cached so repeated views and questions load quickly. Cached answers are only reused while the data and definitions are unchanged, and the proof receipt says whether an answer was cached or live.
+- **New questions run live.** The first time a new question is asked, the agent queries the metrics and searches the contracts. The Personas tab runs its three questions in parallel and retries once if the agent asks a question instead of answering.
+
 ## Quick start
 
-Setup is fully scripted. The database scripts in `sql/` run in numeric order (`00` to `09`) and the app lives in `streamlit_app/`.
+Setup is fully scripted. The database scripts in `sql/` run in numeric order (`00` to `10`) and the app lives in `streamlit_app/`.
 
 ```bash
 ./deploy.sh <connection_name>
@@ -132,15 +139,16 @@ On Windows, run `deploy.sh` from Git Bash or WSL. To check consistency across ro
 
 | Path | Contents |
 |---|---|
-| `sql/` | Numbered setup scripts: data, metric pipeline, definitions, governance, question answering, tests, corrective actions |
-| `streamlit_app/` | The app |
-| `tests/` | Persona consistency test |
+| `sql/` | Numbered setup scripts (`00` to `10`): data, metric pipeline, definitions, governance, question answering, tests, corrective actions, saved answers |
+| `streamlit_app/` | The app, with the persona logic in `personas.py` and the answer cache in `answer_cache.py` |
+| `tests/` | Persona consistency, agent behaviour and app smoke tests |
 | `skills/` | A reusable skill that turns a data schema into a governed set of metric definitions |
 | `docs/` | Design notes and architecture diagram |
 
 ## Limitations
 
 - The app runs in a private workspace, so there is no public live link.
+- A new question is answered live, so the first answer takes longer than a repeat.
 - The Governance tab shows a captured snapshot of each role's view rather than switching roles live.
 - No formal accuracy test set has been run yet for the question answering.
 - Slack and Jira alerts are planned, not built.

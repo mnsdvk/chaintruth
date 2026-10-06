@@ -11,4 +11,6 @@ entities:
     main_file: streamlit_app/app.py
     artifacts:
       - streamlit_app/app.py
+      - streamlit_app/personas.py
+      - streamlit_app/answer_cache.py
       - streamlit_app/environment.yml

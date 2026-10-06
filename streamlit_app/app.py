@@ -1,5 +1,7 @@
 """ChainTruth — One supply chain. One definition. One answer."""
-import json, time, traceback, re, hashlib
+import json, time, traceback, re, hashlib, os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import answer_cache as AC
 import pandas as pd
 import streamlit as st
 
@@ -34,10 +36,11 @@ section.main>div{padding-top:0!important;margin-top:-1rem!important;}
 
 .ct-hdr{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;
   padding:8px 0 6px;margin-bottom:2px;border-bottom:1px solid var(--border);}
-.ct-hdr-l{display:flex;align-items:baseline;gap:10px;}
-.ct-brand{font-size:1.3rem;font-weight:700;letter-spacing:-.02em;color:var(--ink);}
-.ct-tag{font-size:.8rem;color:var(--muted);}
-.ct-chips{display:flex;gap:6px;flex-wrap:wrap;}
+.ct-hdr-l{display:flex;flex-direction:column;gap:0;justify-content:center;padding-bottom:10px;}
+.ct-brand{font-family:Georgia,'Iowan Old Style','Palatino Linotype',Cambria,serif;
+  font-size:2.2rem;font-weight:600;letter-spacing:-.01em;line-height:1;color:var(--ink);}
+.ct-tag{font-size:.8rem;letter-spacing:.06em;color:var(--muted);margin-top:2px;}
+.ct-chips{display:flex;gap:6px;flex-wrap:nowrap;align-items:center;}
 .ct-chip{font-size:.7rem;font-weight:600;letter-spacing:.04em;text-transform:uppercase;
   padding:2px 9px;border-radius:4px;border:1px solid var(--border);color:var(--muted);
   font-variant-numeric:tabular-nums;}
@@ -148,12 +151,21 @@ section.main>div{padding-top:0!important;margin-top:-1rem!important;}
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def q(sql):
     return session.sql(sql).to_pandas()
 
 def run_nocache(sql):
     return session.sql(sql).to_pandas()
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def search_preview(supplier_id, query, limit):
+    """Contract clauses for one supplier via SEARCH_PREVIEW, cached per (supplier, query, limit)."""
+    payload = json.dumps({"query": query,
+        "columns": ["doc_id","doc_type","supplier_name","doc_text","expiry_date"],
+        "filter": {"@eq": {"supplier_id": supplier_id}}, "limit": limit}).replace("'","''")
+    raw = session.sql(f"SELECT SNOWFLAKE.CORTEX.SEARCH_PREVIEW('{SEARCH}','{payload}') AS r").to_pandas().iloc[0]["R"]
+    return json.loads(raw).get("results", [])
 
 def safe_select(sql):
     s = sql.strip().lower()
@@ -225,13 +237,24 @@ def parse_agent_response(resp):
     return {"texts":texts, "tools":set(tools_used), "tool_steps":tool_steps,
             "sql":sql_stmts[-1] if sql_stmts else None, "search_results":search_results}
 
-_NARRATION = re.compile(r"^(I'll |Let me |I will |I need to |First,? I'll |OK,? |Sure,? |I can answer |The semantic model ).*?[.!]\s*", re.IGNORECASE)
+# Leading sentences that narrate the agent's plan, rules or tool choice (display only;
+# the Proof panel keeps the full text).
+_NARRATION = re.compile(
+    r"\brules?\b|\binstructions?\b|\bI'll\b|\bI will\b|\blet me\b|\bI need to\b|"
+    r"\bSupplyChainAnalyst\b|\bContractSearch\b|\b(call|calling|use|using|query|querying|search|searching)\s+(the\s+)?(tool|analyst|search)",
+    re.IGNORECASE)
+_SENT = re.compile(r"^(.*?[.!?:])(\s+|$)", re.DOTALL)
 def strip_narration(text):
-    lines = text.split("\n")
-    cleaned = []
-    for line in lines:
-        cleaned.append(_NARRATION.sub("", line))
-    return "\n".join(cleaned)
+    t = text.lstrip()
+    while t:
+        first_line, _, rest_lines = t.partition("\n")
+        m = _SENT.match(first_line)
+        sent = m.group(1) if m else first_line
+        if not _NARRATION.search(sent):
+            break
+        remainder = first_line[len(m.group(0)):] if m else ""
+        t = (remainder + ("\n" + rest_lines if rest_lines else "")).lstrip()
+    return t
 
 def compute_badge(parsed, result_df=None):
     has_analyst = "SupplyChainAnalyst" in parsed["tools"]
@@ -298,11 +321,7 @@ def fetch_contract_evidence(supplier_ids, limit_per=2):
     seen_doc_ids = set()
     for sid in supplier_ids[:3]:
         try:
-            payload = json.dumps({"query":"late delivery penalty SLA expiry",
-                "columns":["doc_id","doc_type","supplier_name","doc_text","expiry_date"],
-                "filter":{"@eq":{"supplier_id":sid}},"limit":limit_per}).replace("'","''")
-            raw = run_nocache(f"SELECT SNOWFLAKE.CORTEX.SEARCH_PREVIEW('{SEARCH}','{payload}') AS r").iloc[0]["R"]
-            for hit in json.loads(raw).get("results",[]):
+            for hit in search_preview(sid, "late delivery penalty SLA expiry", limit_per):
                 did = hit.get("doc_id","")
                 if did and did not in seen_doc_ids:
                     seen_doc_ids.add(did)
@@ -374,6 +393,18 @@ SQL = {
       FROM SC_ONTOLOGY.GOVERNANCE.ALERTS ORDER BY alert_ts DESC LIMIT 50""",
   "in_transit":"""SELECT COUNT(*) AS n FROM SC_ONTOLOGY.CURATED.DT_ORDER_LINE
       WHERE delivered_date > CURRENT_DATE()""",
+  # One round trip for the header + Overview KPIs: replaces kpi_main, kpi_doi, in_transit,
+  # canonical_otd, data_freshness and header_tests (same expressions, same values).
+  "ov_core":"""SELECT k.otd_pct, k.fill_rate_pct, k.in_full_pct,
+      (SELECT days_of_inventory FROM SEMANTIC_VIEW(SC_ONTOLOGY.ONTOLOGY.SV_SUPPLY_CHAIN METRICS inventory.days_of_inventory)) AS days_of_inventory,
+      (SELECT COUNT(*) FROM SC_ONTOLOGY.CURATED.DT_ORDER_LINE WHERE delivered_date > CURRENT_DATE()) AS n_transit,
+      (SELECT MAX(delivered_date) FROM SC_ONTOLOGY.CURATED.FACT_ORDER_LINE) AS latest,
+      t.total, t.passed, t.last_run
+    FROM SEMANTIC_VIEW(SC_ONTOLOGY.ONTOLOGY.SV_SUPPLY_CHAIN
+           METRICS order_lines.otd_pct, order_lines.fill_rate_pct, order_lines.in_full_pct) k,
+         (SELECT COUNT(*) AS total, COUNT_IF(passed) AS passed, MAX(run_ts) AS last_run
+            FROM SC_ONTOLOGY.GOVERNANCE.CONSISTENCY_RESULTS
+            WHERE run_id=(SELECT run_id FROM SC_ONTOLOGY.GOVERNANCE.CONSISTENCY_RESULTS ORDER BY run_ts DESC LIMIT 1)) t""",
   "bridge_planning":"""SELECT
       ROUND(100*AVG(IFF(e.goods_issue_date <= e.requested_date,1,0)),4) AS step0,
       ROUND(100*AVG(IFF(l.carrier_delivered_ts::DATE <= e.requested_date,1,0)),4) AS step1,
@@ -402,7 +433,7 @@ SQL = {
                METRICS order_lines.otd_pct, order_lines.line_count)) o
     JOIN SC_ONTOLOGY.CURATED.DIM_SUPPLIER d ON d.supplier_id = o.SUPPLIER_ID""",
   "data_freshness":"SELECT MAX(delivered_date) AS latest FROM SC_ONTOLOGY.CURATED.FACT_ORDER_LINE",
-  "corrective_actions":"""SELECT supplier_id, supplier_name, ROUND(otd_pct,1) AS otd_pct,
+  "corrective_actions":"""SELECT action_id, supplier_id, supplier_name, ROUND(otd_pct,1) AS otd_pct,
       contract_expiry, status, created_at
     FROM SC_ONTOLOGY.GOVERNANCE.CORRECTIVE_ACTIONS ORDER BY created_at DESC""",
   "lineage_metrics":"""SELECT metric_name, display_name, formula_sql, owner_persona
@@ -414,17 +445,10 @@ SQL = {
 # Header
 # ---------------------------------------------------------------------------
 with safe_section("header"):
-    hm = q(SQL["header_metrics"]).iloc[0]["N"]
-    ht = q(SQL["header_tests"])
-    t_total = int(ht.iloc[0]["TOTAL"]) if not ht.empty and ht.iloc[0]["TOTAL"] else 0
-    t_pass = int(ht.iloc[0]["PASSED"]) if not ht.empty and ht.iloc[0]["PASSED"] else 0
-    role = q(SQL["header_role"]).iloc[0]["R"]
-    tok = "ct-chip-ok" if t_pass==t_total and t_total>0 else ""
-    st.markdown(f'<div class="ct-hdr"><div class="ct-hdr-l"><span class="ct-brand">ChainTruth</span>'
-                f'<span class="ct-tag">One supply chain. One definition. One answer.</span></div>'
-                f'<div class="ct-chips"><span class="ct-chip">{hm} canonical metrics</span>'
-                f'<span class="ct-chip {tok}">{t_pass}/{t_total} tests passing</span>'
-                f'<span class="ct-chip">{role}</span></div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="ct-hdr-l"><span class="ct-brand">ChainTruth</span>'
+                '<span class="ct-tag">One supply chain. One definition. One answer.</span></div>',
+                unsafe_allow_html=True)
+    st.markdown('<div style="border-bottom:1px solid var(--border);margin:-8px 0 2px;"></div>', unsafe_allow_html=True)
 
 tabs = st.tabs(["Overview","Ask","Personas","Governance","Ontology","Trust"])
 
@@ -441,14 +465,14 @@ with tabs[0]:
         for _,r in nc.iterrows():
             short=r["TEAM_DEFINITION"].split("(")[0].strip()
             items+=f'<div class="ct-cf-item"><div class="ct-cf-num">{r["OTD_PCT"]:.1f}%</div><div class="ct-cf-lbl"><strong>{short}</strong><br>{labels.get(short,"")}</div></div>'
-        st.markdown(f'<div class="ct-sl">The problem: four teams, four numbers</div>'
+        st.markdown(f'<div class="ct-sl">The problem: three teams, three numbers</div>'
             f'<div class="ct-cf-row">{items}</div>'
             f'<div class="ct-cn-block"><div class="ct-cn-num">{cv:.1f}%</div>'
             f'<div class="ct-cn-meta"><strong>Canonical OTD</strong><br>Delivered (carrier proof of delivery) on or before the date promised to the customer.</div></div>'
             f'<div class="ct-spread">{spread:.1f}-point spread replaced by one governed definition</div>', unsafe_allow_html=True)
 
     with safe_section("KPI cards"):
-        kpis=q(SQL["kpi_main"]); doi=q(SQL["kpi_doi"])
+        kpis=q(SQL["ov_core"]); doi=kpis
         def fv(df,col,fmt=".1f"): return f"{df.iloc[0][col]:{fmt}}" if not df.empty and pd.notna(df.iloc[0][col]) else "—"
         st.markdown(f'<div class="ct-kpis">'
             f'<div class="ct-kpi"><div class="ct-kpi-l">On-time delivery</div><div class="ct-kpi-v">{fv(kpis,"OTD_PCT")}<span class="ct-kpi-u">%</span></div></div>'
@@ -458,8 +482,8 @@ with tabs[0]:
             f'</div>', unsafe_allow_html=True)
 
     with safe_section("in-transit note"):
-        itr = q(SQL["in_transit"])
-        n_transit = int(itr.iloc[0]["N"]) if not itr.empty else 0
+        itr = q(SQL["ov_core"])
+        n_transit = int(itr.iloc[0]["N_TRANSIT"]) if not itr.empty else 0
         if n_transit > 0:
             st.caption(f"{n_transit:,} order lines still in transit (future delivery date), excluded from all delivery-performance metrics above.")
 
@@ -596,7 +620,7 @@ with tabs[0]:
         st.markdown('<div class="ct-sl">Supplier risk quadrant</div>', unsafe_allow_html=True)
         import altair as alt
         scat_df = q(SQL["scatter_suppliers"])
-        canon_otd_rq = float(q(SQL["canonical_otd"]).iloc[0]["OTD_PCT"])
+        canon_otd_rq = float(q(SQL["ov_core"]).iloc[0]["OTD_PCT"])
         if not scat_df.empty:
             scat_df["OTD_PCT"] = scat_df["OTD_PCT"].astype(float)
             scat_df["DAYS_TO_CONTRACT_EXPIRY"] = scat_df["DAYS_TO_CONTRACT_EXPIRY"].astype(float)
@@ -639,13 +663,9 @@ with tabs[0]:
                 st.markdown('<div class="ct-sl">At-risk suppliers</div>', unsafe_allow_html=True)
                 sel_sup = st.selectbox("Select a supplier", risk_sups["SUPPLIER_NAME"].tolist(), key="rq_sup")
                 sel_id = risk_sups[risk_sups["SUPPLIER_NAME"] == sel_sup].iloc[0]["SUPPLIER_ID"]
-                # fetch contract clauses
+                # fetch contract clauses (cached per supplier)
                 try:
-                    payload = json.dumps({"query":"SLA penalty late delivery corrective action",
-                        "columns":["doc_id","doc_type","supplier_name","doc_text","expiry_date"],
-                        "filter":{"@eq":{"supplier_id":sel_id}},"limit":3}).replace("'","''")
-                    raw_search = run_nocache(f"SELECT SNOWFLAKE.CORTEX.SEARCH_PREVIEW('{SEARCH}','{payload}') AS r").iloc[0]["R"]
-                    for hit in json.loads(raw_search).get("results",[]):
+                    for hit in search_preview(sel_id, "SLA penalty late delivery corrective action", 3):
                         did = hit.get("doc_id",""); dtxt = hit.get("doc_text","")
                         if did or dtxt:
                             st.markdown(f'<div class="ct-doc"><span class="ct-doc-id">{did}</span> {dtxt}</div>', unsafe_allow_html=True)
@@ -661,23 +681,27 @@ with tabs[0]:
                     else:
                         st.success(ca_result)
 
-            # open corrective actions
-            ca_all = q(SQL["corrective_actions"])
+            # open corrective actions (always read fresh)
+            if st.session_state.get("ca_close_msg"):
+                st.success(st.session_state.pop("ca_close_msg"))
+            ca_all = run_nocache(SQL["corrective_actions"])
             ca_open = ca_all[ca_all["STATUS"] == "OPEN"] if not ca_all.empty else ca_all
             ca_closed = ca_all[ca_all["STATUS"] == "CLOSED"] if not ca_all.empty else ca_all
             if not ca_open.empty:
                 st.markdown('<div class="ct-sl">Open corrective actions</div>', unsafe_allow_html=True)
-                st.dataframe(ca_open, use_container_width=True, hide_index=True)
+                st.dataframe(ca_open[["SUPPLIER_ID","SUPPLIER_NAME","OTD_PCT","CONTRACT_EXPIRY","STATUS","CREATED_AT"]],
+                             use_container_width=True, hide_index=True)
+            n_open = len(ca_open)
+            if st.button("Close all open actions", key="ca_close_all", type="secondary",
+                         disabled=(n_open == 0)):
+                close_r = run_nocache("CALL SC_ONTOLOGY.GOVERNANCE.RESET_CORRECTIVE_ACTIONS()").iloc[0][0]
+                st.session_state["ca_close_msg"] = f"{n_open} action{'s' if n_open != 1 else ''} closed."
+                st.rerun()
             n_closed = len(ca_closed)
             if n_closed > 0:
-                st.caption(f"{n_closed} earlier action{'s' if n_closed != 1 else ''} closed.")
                 with st.expander("Action history"):
-                    st.dataframe(ca_closed, use_container_width=True, hide_index=True)
-            with st.expander("Demo controls"):
-                if st.button("Reset demo actions", key="ca_reset", help="Sets all OPEN actions to CLOSED (no rows deleted)"):
-                    with st.spinner("Resetting..."):
-                        reset_r = run_nocache("CALL SC_ONTOLOGY.GOVERNANCE.RESET_CORRECTIVE_ACTIONS()").iloc[0][0]
-                    st.info(reset_r)
+                    ca_hist = ca_closed.drop(columns=["ACTION_ID"], errors="ignore").head(5)
+                    st.dataframe(ca_hist, use_container_width=True, hide_index=True)
 
 # ===== TAB 2: ASK =====
 with tabs[1]:
@@ -732,63 +756,111 @@ with tabs[1]:
             run_ts = time.strftime("%Y-%m-%d %H:%M:%S")
             st.session_state["ask_last_q"] = question
             st.session_state["ask_last_ts"] = run_ts
-            t0 = time.time()
-            progress = st.empty()
-            progress.info("Calling the ChainTruth agent... this may take 20-60 s for cross-domain questions.")
-            parsed = None
+
+            # --- cache lookup ---
+            ask_from_cache = False
             try:
-                resp = ask_agent(question)
-                parsed = parse_agent_response(resp)
-            except Exception as e:
-                elapsed = time.time() - t0
-                if elapsed > 55:
-                    progress.warning(f"Agent timed out after {elapsed:.0f}s.")
-                    if st.button("Retry", key="retry"):
-                        st.session_state["ask_pending"] = True
-                        st.rerun()
-                    st.stop()
-                progress.empty()
-                with st.expander("Diagnostic"):
-                    st.code(traceback.format_exc(), language="text")
-                st.error(f"Agent call failed: {e}")
-                st.stop()
-            elapsed = time.time() - t0
-            progress.empty()
-
-            # execute SQL
-            result_df = None
-            gen_sql = parsed["sql"]
-            if gen_sql and safe_select(gen_sql):
+                ask_dv = AC.data_version(session)
+            except Exception:
+                ask_dv = None
+            cache_hit = None
+            if ask_dv:
                 try:
-                    result_df = run_nocache(gen_sql)
+                    cache_hit = AC.lookup(session, question, ask_dv)
                 except Exception:
-                    result_df = None
+                    cache_hit = None
 
-            # deterministic contract evidence
-            sup_col = None
-            if result_df is not None and not result_df.empty:
-                sup_col = next((c for c in result_df.columns if c.upper() == "SUPPLIER_ID"), None)
-            all_evidence = list(parsed.get("search_results", []))
-            app_fetched = False
-            # fetch from result supplier_ids
-            if sup_col and result_df is not None and not result_df.empty:
-                sids = result_df[sup_col].head(3).tolist()
-                fetched = fetch_contract_evidence(sids)
-                seen = {h.get("doc_id") for h in all_evidence if h.get("doc_id")}
-                for h in fetched:
-                    if h.get("doc_id") and h.get("doc_id") not in seen:
-                        all_evidence.append(h)
-                        seen.add(h.get("doc_id"))
-                if fetched:
-                    app_fetched = True
-                    parsed["tools"].add("ContractSearch")
-            # for contract-only questions: if agent returned search results without doc_id,
-            # extract SUP-XXX from the answer and fetch proper evidence
-            if not app_fetched and "ContractSearch" in parsed["tools"]:
-                answer_tmp = "\n".join(parsed["texts"])
-                sup_ids_in_text = list(set(re.findall(r'SUP-\d{3}', answer_tmp)))[:3]
-                if sup_ids_in_text:
-                    fetched = fetch_contract_evidence(sup_ids_in_text)
+            if cache_hit:
+                # ---- SERVE FROM CACHE ----
+                ask_from_cache = True
+                elapsed = cache_hit["ELAPSED_SECONDS"]
+                saved_hhmi = cache_hit["SAVED_HHMI"]
+                gen_sql = cache_hit["SQL_TEXT"] or None
+                answer_full = cache_hit["ANSWER_TEXT"]
+                cached_tools_str = cache_hit.get("TOOLS", "")
+                cached_tools = set(cached_tools_str.split(",")) if cached_tools_str else set()
+                cached_evidence = cache_hit.get("EVIDENCE", {})
+
+                # re-execute saved SQL for fresh result_df
+                result_df = None
+                if gen_sql and safe_select(gen_sql):
+                    try:
+                        result_df = run_nocache(gen_sql)
+                    except Exception:
+                        result_df = None
+
+                # rebuild parsed-like structure for badge computation
+                is_refusal = not gen_sql and "ContractSearch" not in cached_tools
+                parsed = {"texts": [answer_full], "tools": cached_tools, "tool_steps": [],
+                          "sql": gen_sql, "search_results": []}
+
+                # contract evidence from cache
+                all_evidence = []
+                if isinstance(cached_evidence, list):
+                    all_evidence = cached_evidence
+                elif isinstance(cached_evidence, dict) and cached_evidence:
+                    all_evidence = [cached_evidence]
+                app_fetched = False
+
+                badge_cls, badge_txt = compute_badge(parsed, result_df)
+                if all_evidence and "SupplyChainAnalyst" in cached_tools:
+                    badge_cls, badge_txt = "gov", "Governed metric + contract evidence"
+
+                # no fake timeline for cached answers
+                tl_html = ""
+
+                answer_display = strip_narration(answer_full)
+                blocks = re.split(r'\n{2,}', answer_display.strip())
+                short_blocks = blocks[:2] if blocks else []
+                long_blocks = blocks[2:] if len(blocks) > 2 else []
+                short_answer = "\n\n".join(short_blocks)
+                long_answer = "\n\n".join(long_blocks)
+
+            else:
+                # ---- LIVE CALL ----
+                t0 = time.time()
+                progress = st.empty()
+                progress.info("Calling the ChainTruth agent... this may take 20-60 s for cross-domain questions.")
+                parsed = None
+                try:
+                    resp = ask_agent(question)
+                    parsed = parse_agent_response(resp)
+                except Exception as e:
+                    elapsed = time.time() - t0
+                    if elapsed > 55:
+                        progress.warning(f"Agent timed out after {elapsed:.0f}s.")
+                        if st.button("Retry", key="retry"):
+                            st.session_state["ask_pending"] = True
+                            st.rerun()
+                        st.stop()
+                    progress.empty()
+                    with st.expander("Diagnostic"):
+                        st.code(traceback.format_exc(), language="text")
+                    st.error(f"Agent call failed: {e}")
+                    st.stop()
+                elapsed = time.time() - t0
+                progress.empty()
+
+            if not ask_from_cache:
+                # execute SQL
+                result_df = None
+                gen_sql = parsed["sql"]
+                if gen_sql and safe_select(gen_sql):
+                    try:
+                        result_df = run_nocache(gen_sql)
+                    except Exception:
+                        result_df = None
+
+                # deterministic contract evidence
+                sup_col = None
+                if result_df is not None and not result_df.empty:
+                    sup_col = next((c for c in result_df.columns if c.upper() == "SUPPLIER_ID"), None)
+                all_evidence = list(parsed.get("search_results", []))
+                app_fetched = False
+                # fetch from result supplier_ids
+                if sup_col and result_df is not None and not result_df.empty:
+                    sids = result_df[sup_col].head(3).tolist()
+                    fetched = fetch_contract_evidence(sids)
                     seen = {h.get("doc_id") for h in all_evidence if h.get("doc_id")}
                     for h in fetched:
                         if h.get("doc_id") and h.get("doc_id") not in seen:
@@ -796,44 +868,67 @@ with tabs[1]:
                             seen.add(h.get("doc_id"))
                     if fetched:
                         app_fetched = True
+                        parsed["tools"].add("ContractSearch")
+                # for contract-only questions: if agent returned search results without doc_id,
+                # extract SUP-XXX from the answer and fetch proper evidence
+                if not app_fetched and "ContractSearch" in parsed["tools"]:
+                    answer_tmp = "\n".join(parsed["texts"])
+                    sup_ids_in_text = list(set(re.findall(r'SUP-\d{3}', answer_tmp)))[:3]
+                    if sup_ids_in_text:
+                        fetched = fetch_contract_evidence(sup_ids_in_text)
+                        seen = {h.get("doc_id") for h in all_evidence if h.get("doc_id")}
+                        for h in fetched:
+                            if h.get("doc_id") and h.get("doc_id") not in seen:
+                                all_evidence.append(h)
+                                seen.add(h.get("doc_id"))
+                        if fetched:
+                            app_fetched = True
 
-            # badge
-            badge_cls, badge_txt = compute_badge(parsed, result_df)
-            if all_evidence and "SupplyChainAnalyst" in parsed["tools"]:
-                badge_cls, badge_txt = "gov", "Governed metric + contract evidence"
-            is_refusal = badge_cls == "ref"
+                # badge
+                badge_cls, badge_txt = compute_badge(parsed, result_df)
+                if all_evidence and "SupplyChainAnalyst" in parsed["tools"]:
+                    badge_cls, badge_txt = "gov", "Governed metric + contract evidence"
+                is_refusal = badge_cls == "ref"
 
-            # timeline (fix 5: grammar)
-            tl_steps = []
-            step_n = 0
-            agent_sc = sum(1 for t in parsed.get("tool_steps", []) if t == "ContractSearch")
-            for t in parsed.get("tool_steps", []):
-                step_n += 1
-                if t == "SupplyChainAnalyst":
-                    tl_steps.append(f"<b>{step_n}</b> Governed metrics queried")
-                elif t == "ContractSearch" and agent_sc > 0:
-                    s_word = "supplier" if agent_sc == 1 else "suppliers"
-                    tl_steps.append(f"<b>{step_n}</b> Contracts searched ({agent_sc} {s_word})")
-                    agent_sc = 0
-            if app_fetched:
-                step_n += 1
-                n_fetched = len(set(result_df[sup_col].head(3).tolist())) if sup_col else 0
-                s_word = "supplier" if n_fetched == 1 else "suppliers"
-                tl_steps.append(f"<b>{step_n}</b> Contracts retrieved ({n_fetched} {s_word})")
-            if tl_steps:
-                step_n += 1
-                tl_steps.append(f"<b>{step_n}</b> Answer composed")
-            tl_html = f'<div class="ct-tl">{" &rarr; ".join(tl_steps)} &middot; {elapsed:.1f}s</div>' if tl_steps else ""
+                # timeline (fix 5: grammar)
+                tl_steps = []
+                step_n = 0
+                agent_sc = sum(1 for t in parsed.get("tool_steps", []) if t == "ContractSearch")
+                for t in parsed.get("tool_steps", []):
+                    step_n += 1
+                    if t == "SupplyChainAnalyst":
+                        tl_steps.append(f"<b>{step_n}</b> Governed metrics queried")
+                    elif t == "ContractSearch" and agent_sc > 0:
+                        s_word = "supplier" if agent_sc == 1 else "suppliers"
+                        tl_steps.append(f"<b>{step_n}</b> Contracts searched ({agent_sc} {s_word})")
+                        agent_sc = 0
+                if app_fetched:
+                    step_n += 1
+                    n_fetched = len(set(result_df[sup_col].head(3).tolist())) if sup_col else 0
+                    s_word = "supplier" if n_fetched == 1 else "suppliers"
+                    tl_steps.append(f"<b>{step_n}</b> Contracts retrieved ({n_fetched} {s_word})")
+                if tl_steps:
+                    step_n += 1
+                    tl_steps.append(f"<b>{step_n}</b> Answer composed")
+                tl_html = f'<div class="ct-tl">{" &rarr; ".join(tl_steps)} &middot; {elapsed:.1f}s</div>' if tl_steps else ""
 
-            # answer text (fix 2: preserve bullets; fix 5: narration strip)
-            answer_full = "\n\n".join(parsed["texts"])
-            answer_display = strip_narration(answer_full)
-            # split on blank lines to preserve bullet structure
-            blocks = re.split(r'\n{2,}', answer_display.strip())
-            short_blocks = blocks[:2] if blocks else []
-            long_blocks = blocks[2:] if len(blocks) > 2 else []
-            short_answer = "\n\n".join(short_blocks)
-            long_answer = "\n\n".join(long_blocks)
+                # answer text (fix 2: preserve bullets; fix 5: narration strip)
+                answer_full = "\n\n".join(parsed["texts"])
+                answer_display = strip_narration(answer_full)
+                # split on blank lines to preserve bullet structure
+                blocks = re.split(r'\n{2,}', answer_display.strip())
+                short_blocks = blocks[:2] if blocks else []
+                long_blocks = blocks[2:] if len(blocks) > 2 else []
+                short_answer = "\n\n".join(short_blocks)
+                long_answer = "\n\n".join(long_blocks)
+
+                # save to cache (save governed answers AND refusals; never save errors/timeouts/clarifying questions)
+                if ask_dv and answer_full.strip():
+                    try:
+                        AC.save(session, question, answer_full, gen_sql or "",
+                                all_evidence, parsed["tools"], elapsed, ask_dv)
+                    except Exception:
+                        pass
 
             # ---- RENDER ----
 
@@ -935,7 +1030,7 @@ with tabs[1]:
                 name_c2 = next((c for c in result_df.columns if "SUPPLIER_NAME" in c.upper()), None)
                 exp_c2 = next((c for c in result_df.columns if "DAYS_TO" in c.upper()), None)
                 if otd_c2 and name_c2:
-                    canon_otd = float(q(SQL["canonical_otd"]).iloc[0]["OTD_PCT"])
+                    canon_otd = float(q(SQL["ov_core"]).iloc[0]["OTD_PCT"])
                     cd = result_df.copy(); cd["_n"] = cd[name_c2]; cd["_o"] = cd[otd_c2].astype(float)
                     if exp_c2: cd["_e"] = cd[exp_c2].astype(float)
                     bars = alt.Chart(cd).mark_bar(color="#0d7377").encode(
@@ -1002,9 +1097,10 @@ with tabs[1]:
                 sql_hash_full = hashlib.sha256(gen_sql.encode()).hexdigest() if gen_sql else "—"
                 row_count = len(result_df) if result_df is not None else 0
                 role_now = q(SQL["header_role"]).iloc[0]["R"]
-                freshness_df = q(SQL["data_freshness"])
+                ov_live = q(SQL["ov_core"])  # cache is cleared after "Run tests now"
+                freshness_df = ov_live
                 data_fresh = str(freshness_df.iloc[0]["LATEST"])[:10] if not freshness_df.empty else "—"
-                ht_live = q(SQL["header_tests"])
+                ht_live = ov_live
                 t_total_r = int(ht_live.iloc[0]["TOTAL"]) if not ht_live.empty and ht_live.iloc[0]["TOTAL"] else 0
                 t_pass_r = int(ht_live.iloc[0]["PASSED"]) if not ht_live.empty and ht_live.iloc[0]["PASSED"] else 0
                 # matched metrics
@@ -1022,6 +1118,7 @@ with tabs[1]:
                 rcpt_html = ('<div class="ct-rcpt">'
                     + _rr("Question", question)
                     + _rr("Timestamp", run_ts)
+                    + _rr("Source", f"Cached (saved {saved_hhmi})" if ask_from_cache else "Live")
                     + _rr("Role", f"{role_now} (app runs with the owner's rights)")
                     + _rr("Tools called", tools_txt)
                     + _rr("Metric", metric_txt)
@@ -1034,7 +1131,9 @@ with tabs[1]:
                 st.markdown(rcpt_html, unsafe_allow_html=True)
 
                 receipt_json = json.dumps({
-                    "question": question, "timestamp": run_ts, "role": role_now,
+                    "question": question, "timestamp": run_ts,
+                    "source": f"cached (saved {saved_hhmi})" if ask_from_cache else "live",
+                    "role": role_now,
                     "tools": sorted(parsed["tools"]), "metric": metric_txt,
                     "definition": defn_txt, "sql_hash_sha256": sql_hash_full,
                     "rows": row_count, "data_freshness": data_fresh,
@@ -1052,47 +1151,52 @@ with tabs[1]:
 # ===== TAB 3: PERSONAS =====
 with tabs[2]:
     with safe_section("Personas"):
+        import personas as PR
         st.markdown('<div class="ct-sl">Same metric, different words, one number</div>', unsafe_allow_html=True)
         st.write("Each persona phrases the OTD question differently. All three must resolve to the same canonical definition.")
-        PERSONAS=[
-            ("Planning","What's our on-time delivery rate overall?"),
-            ("Procurement","Across all suppliers, what percent of deliveries arrive on time?"),
-            ("Logistics","What share of shipments get delivered by the promised date?"),
-        ]
-        if st.button("Run all three",type="primary",key="per_go"):
-            out=[]
-            bar=st.progress(0,text="Running persona queries...")
-            for i,(persona,phrase) in enumerate(PERSONAS):
-                bar.progress((i)/(len(PERSONAS)),text=f"Asking as {persona}...")
-                try:
-                    resp=ask_agent(phrase)
-                    val=extract_otd_from_agent(resp)
-                except Exception as ex:
-                    val=None
-                    with st.expander(f"Diagnostic: {persona}"):
-                        st.code(traceback.format_exc(), language="text")
-                out.append({"persona":persona,"question":phrase,"value":val})
-            bar.progress(1.0,text="Done.")
-            cols=st.columns(3)
-            for i,item in enumerate(out):
-                v=item["value"]
-                vs=f"{v:.2f}%" if v is not None else "—"
-                vc="" if v is not None else " ct-null"
-                cols[i].markdown(f'<div class="ct-per"><div class="ct-per-n">{item["persona"]}</div>'
-                    f'<div class="ct-per-q">"{item["question"]}"</div>'
-                    f'<div class="ct-per-v{vc}">{vs}</div></div>', unsafe_allow_html=True)
-            vals=[x["value"] for x in out if x["value"] is not None]
-            unique=set(round(v,4) for v in vals)
-            if len(unique)==1 and len(vals)==3:
-                st.markdown('<span class="ct-pill ct-pill-ok">Consistent: all personas see the same value</span>', unsafe_allow_html=True)
+        if "per_results" not in st.session_state:
+            st.session_state["per_results"] = {}
+        go = st.button("Run all three", type="primary", key="per_go")
+        status = st.empty()
+        grid = st.columns(3)
+        slots = {name: grid[i].empty() for i, (name, _) in enumerate(PR.PERSONAS)}
+
+        def _card(name, phrase, r):
+            if r is None:
+                body = '<div class="ct-per-v ct-null">—</div>'
+            elif r["value"] is not None:
+                note = f'<div class="ct-fn">{r["reason"]}</div>' if r["reason"] else ""
+                body = f'<div class="ct-per-v">{r["value"]:.2f}%</div>{note}'
             else:
-                st.markdown('<span class="ct-pill ct-pill-bad">Inconsistent or unanswered</span>', unsafe_allow_html=True)
+                body = f'<div class="ct-per-v ct-null">—</div><div class="ct-fn">{r["reason"]}</div>'
+            slots[name].markdown(f'<div class="ct-per"><div class="ct-per-n">{name}</div>'
+                                 f'<div class="ct-per-q">"{phrase}"</div>{body}</div>', unsafe_allow_html=True)
+
+        if go:
+            st.session_state["per_results"] = {}
+            for name, phrase in PR.PERSONAS:
+                _card(name, phrase, None)
+            status.caption("Running 3 persona questions concurrently... 0 of 3 done")
+
+            def _done(name, r):
+                st.session_state["per_results"][name] = r  # stored as soon as it completes
+                _card(name, dict(PR.PERSONAS)[name], r)
+                status.caption(f"{len(st.session_state['per_results'])} of 3 done")
+
+            _, conc = PR.run_all(session, PR.PERSONAS, on_done=_done)
+            status.caption(f"3 of 3 done ({'concurrent' if conc else 'sequential'} run)")
         else:
-            cols=st.columns(3)
-            for i,(persona,phrase) in enumerate(PERSONAS):
-                cols[i].markdown(f'<div class="ct-per"><div class="ct-per-n">{persona}</div>'
-                    f'<div class="ct-per-q">"{phrase}"</div>'
-                    f'<div class="ct-per-v ct-null">—</div></div>', unsafe_allow_html=True)
+            for name, phrase in PR.PERSONAS:
+                _card(name, phrase, st.session_state["per_results"].get(name))
+
+        res_p = st.session_state["per_results"]
+        if len(res_p) == 3:
+            ok, msg = PR.verdict(res_p)
+            st.markdown(f'<span class="ct-pill {"ct-pill-ok" if ok else "ct-pill-bad"}">{msg}</span>', unsafe_allow_html=True)
+        for name, r in res_p.items():
+            if r.get("error"):
+                with st.expander(f"Diagnostic: {name}"):
+                    st.code(r["error"], language="text")
 
 # ===== TAB 4: GOVERNANCE =====
 with tabs[3]:
@@ -1200,8 +1304,13 @@ with tabs[5]:
         if st.button("Run tests now",type="primary",key="trust_go"):
             with st.spinner("Running 9 consistency tests..."):
                 r=run_nocache("CALL SC_ONTOLOGY.GOVERNANCE.RUN_CONSISTENCY_TESTS()").iloc[0][0]
-            st.success(r)
-        res=q(SQL["trust_results"])
+            # header chip and receipts read the cached test count: clear and redraw
+            q.clear()
+            st.session_state["trust_msg"] = r
+            st.rerun()
+        if st.session_state.get("trust_msg"):
+            st.success(st.session_state.pop("trust_msg"))
+        res=run_nocache(SQL["trust_results"])
         if res.empty:
             st.info("No test runs yet. Click 'Run tests now'.")
         else:
@@ -1216,6 +1325,6 @@ with tabs[5]:
             st.markdown(cells, unsafe_allow_html=True)
             st.dataframe(res[["TEST_NAME","METRIC","SEMANTIC_VALUE","GOLDEN_VALUE","PASSED"]], use_container_width=True, hide_index=True)
         st.markdown('<div class="ct-sl" style="margin-top:16px;">Open alerts</div>', unsafe_allow_html=True)
-        alerts=q(SQL["alerts"])
+        alerts=run_nocache(SQL["alerts"])
         if alerts.empty: st.caption("No open alerts.")
         else: st.dataframe(alerts, use_container_width=True, hide_index=True)

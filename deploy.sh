@@ -2,7 +2,7 @@
 # Deploys ChainTruth with the Snowflake CLI. Ideally run these steps THROUGH CoCo (see docs/COCO_PLAYBOOK.md).
 set -euo pipefail
 CONN="${1:-default}"
-for f in sql/0*.sql; do
+for f in sql/[01]*.sql; do
   echo ">> $f"
   snow sql --connection "$CONN" -f "$f"
 done
